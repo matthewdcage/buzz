@@ -1352,6 +1352,12 @@ fn format_conversation_context(
 #[derive(Default)]
 pub struct FormatPromptArgs<'a> {
     pub agent_core: Option<&'a str>,
+    /// Rendered `[Agent Memory — honcho]` section (see `honcho_fetch::build_honcho_section`).
+    /// Same delivery semantics as `agent_core`: rides in the user message for
+    /// legacy agents only, immediately alongside core, omitted for modern
+    /// agents (protocol_version >= 2) since it is delivered via the system
+    /// role in `session/new` instead.
+    pub agent_honcho: Option<&'a str>,
     pub channel_info: Option<&'a PromptChannelInfo>,
     pub conversation_context: Option<&'a ConversationContext>,
     pub profile_lookup: Option<&'a PromptProfileLookup>,
@@ -1389,9 +1395,10 @@ pub(crate) fn base_section(base_prompt: &str) -> String {
 /// 0. `[Base]` — base prompt (only for legacy agents without systemPrompt support)
 /// 1. `[System]` — system prompt (only for legacy agents without systemPrompt support)
 /// 2. `[Agent Memory — core]` — if agent core memory is set
-/// 3. `[Context]` — scope, channel name, and contextual hints for the agent
-/// 4. `[Thread Context]` or `[Conversation Context]` — if fetched
-/// 5. `[Event]` / `[Buzz events]` — the triggering event(s)
+/// 3. `[Agent Memory — honcho]` — if Honcho peer context is set
+/// 4. `[Context]` — scope, channel name, and contextual hints for the agent
+/// 5. `[Thread Context]` or `[Conversation Context]` — if fetched
+/// 6. `[Event]` / `[Buzz events]` — the triggering event(s)
 ///
 /// Each section is returned as its own block rather than one joined string so
 /// the observer frame's size trimmer (`fit_observer_event_to_budget`) elides
@@ -1450,6 +1457,11 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
     if !args.has_system_prompt_support {
         if let Some(core) = args.agent_core {
             sections.push(core.to_string());
+        }
+        // Honcho peer context — same delivery semantics as core above, and
+        // rendered immediately alongside it.
+        if let Some(honcho) = args.agent_honcho {
+            sections.push(honcho.to_string());
         }
         // Channel canvas metadata — same delivery semantics as core for legacy agents.
         if let Some(canvas) = args.agent_canvas {
@@ -2262,6 +2274,72 @@ mod tests {
             prompt.starts_with("[Agent Memory — core]\nbe helpful\n\n[Context]"),
             "expected core block first, then [Context]; got: {prompt}"
         );
+    }
+
+    #[test]
+    fn test_format_prompt_with_agent_honcho_alongside_core() {
+        let ch = Uuid::new_v4();
+        let event = make_event("hi");
+        let batch = FlushBatch {
+            channel_id: ch,
+            events: vec![BatchEvent {
+                event,
+                prompt_tag: "test".into(),
+                received_at: Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let core = "[Agent Memory — core]\nbe helpful";
+        let honcho = "[Agent Memory — honcho]\nlikes concise replies";
+        let prompt = format_prompt(
+            &batch,
+            &FormatPromptArgs {
+                agent_core: Some(core),
+                agent_honcho: Some(honcho),
+                ..Default::default()
+            },
+        )
+        .join("\n\n");
+        assert!(
+            prompt.starts_with(
+                "[Agent Memory — core]\nbe helpful\n\n[Agent Memory — honcho]\nlikes concise replies\n\n[Context]"
+            ),
+            "expected core then honcho then [Context]; got: {prompt}"
+        );
+    }
+
+    #[test]
+    fn test_format_prompt_modern_agent_omits_honcho_from_user_message() {
+        // Modern agents (protocol_version >= 2) receive honcho context via the
+        // system role in session/new, so format_prompt must NOT also emit it
+        // in the user message — otherwise it would double-render.
+        let ch = Uuid::new_v4();
+        let event = make_event("hi");
+        let batch = FlushBatch {
+            channel_id: ch,
+            events: vec![BatchEvent {
+                event,
+                prompt_tag: "test".into(),
+                received_at: Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let prompt = format_prompt(
+            &batch,
+            &FormatPromptArgs {
+                agent_honcho: Some("[Agent Memory — honcho]\nlikes concise replies"),
+                has_system_prompt_support: true,
+                ..Default::default()
+            },
+        )
+        .join("\n\n");
+        assert!(
+            !prompt.contains("[Agent Memory — honcho]"),
+            "modern agents must not get honcho context in the user message; got: {prompt}"
+        );
+        assert!(prompt.starts_with("[Context]"));
     }
 
     #[test]

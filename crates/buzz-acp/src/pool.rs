@@ -23,6 +23,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use nostr::ToBech32;
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
@@ -102,6 +103,10 @@ pub struct SessionState {
     /// fetch fails — all fail open. Cleared on session invalidation alongside
     /// `core_sections` so the next session picks up any canvas change.
     pub canvas_sections: HashMap<Uuid, String>,
+    /// channel_id → rendered Honcho `[Agent Memory — honcho]` prompt section,
+    /// populated once at session creation, same lifecycle as `core_sections`
+    /// (see `honcho_fetch::build_honcho_section`).
+    pub honcho_sections: HashMap<Uuid, String>,
 }
 
 impl SessionState {
@@ -124,6 +129,7 @@ impl SessionState {
         self.turn_counts.remove(channel_id);
         self.core_sections.remove(channel_id);
         self.canvas_sections.remove(channel_id);
+        self.honcho_sections.remove(channel_id);
         self.sessions.remove(channel_id).is_some()
     }
 
@@ -135,6 +141,7 @@ impl SessionState {
         self.heartbeat_turn_count = 0;
         self.core_sections.clear();
         self.canvas_sections.clear();
+        self.honcho_sections.clear();
     }
 
     #[cfg(test)]
@@ -143,6 +150,7 @@ impl SessionState {
             || self.turn_counts.contains_key(channel_id)
             || self.core_sections.contains_key(channel_id)
             || self.canvas_sections.contains_key(channel_id)
+            || self.honcho_sections.contains_key(channel_id)
     }
 }
 
@@ -543,6 +551,19 @@ pub struct PromptContext {
     /// `[Agent Memory — core]` section. On by default; disabled via
     /// `--no-memory` / `BUZZ_ACP_NO_MEMORY`.
     pub memory_enabled: bool,
+    /// Whether native Honcho memory integration is enabled. When false, the
+    /// per-session peer-context fetch is skipped and `honcho_sections`
+    /// remains empty for every channel, so no `[Agent Memory — honcho]`
+    /// section is ever rendered. On by default; disabled via `--no-honcho`
+    /// / `BUZZ_ACP_NO_HONCHO`.
+    pub honcho_enabled: bool,
+    /// Base URL of the Honcho REST API used for the session-start context fetch.
+    pub honcho_api_url: String,
+    /// Bearer token forwarded to Honcho on the context fetch.
+    pub honcho_auth_token: String,
+    /// HTTP client used for the Honcho context fetch. Cheap to clone (wraps
+    /// an internal connection-pool `Arc`, like `RestClient::http`).
+    pub honcho_http: reqwest::Client,
     /// Harness identity string for NIP-AM `harness` field. Derived from the
     /// configured `agent_command` at startup (e.g. `"goose"`, `"buzz-agent"`).
     pub harness_name: String,
@@ -869,23 +890,28 @@ async fn create_session_and_apply_model(
     agent: &mut OwnedAgent,
     ctx: &PromptContext,
     agent_core: Option<&str>,
+    agent_honcho: Option<&str>,
     agent_canvas: Option<&str>,
     channel_name: Option<&str>,
 ) -> Result<String, AcpError> {
-    // Build base_prompt + system_prompt + agent core + canvas metadata into a
-    // single prompt. Standard protocol-v2 agents receive it in `session/new`;
-    // Goose receives it through the custom request below. Legacy agents receive
-    // the same content as user-message sections via `format_prompt`. Core carries
-    // its own `[Agent Memory — core]` header, and canvas carries its own
-    // `[Channel Canvas]` header; both are appended with a blank-line separator.
+    // Build base_prompt + system_prompt + agent core + honcho context + canvas
+    // metadata into a single prompt. Standard protocol-v2 agents receive it in
+    // `session/new`; Goose receives it through the custom request below. Legacy
+    // agents receive the same content as user-message sections via
+    // `format_prompt`. Core and honcho each carry their own `[Agent Memory —
+    // …]` header, and canvas carries its own `[Channel Canvas]` header; all are
+    // appended with a blank-line separator.
     let is_goose = agent.agent_name == "goose";
     let combined_system_prompt = with_canvas(
-        with_core(
-            with_team(
-                framed_system_prompt(&ctx.cwd, ctx.base_prompt, ctx.system_prompt.as_deref()),
-                ctx.team_instructions.as_deref(),
+        with_honcho(
+            with_core(
+                with_team(
+                    framed_system_prompt(&ctx.cwd, ctx.base_prompt, ctx.system_prompt.as_deref()),
+                    ctx.team_instructions.as_deref(),
+                ),
+                agent_core,
             ),
-            agent_core,
+            agent_honcho,
         ),
         agent_canvas,
     );
@@ -1276,6 +1302,20 @@ fn with_core(framed: Option<String>, core: Option<&str>) -> Option<String> {
     }
 }
 
+/// Append the agent's Honcho peer-context section onto the framed system prompt.
+///
+/// Honcho already carries its own `[Agent Memory — honcho]` header from
+/// `honcho_fetch::build_honcho_section`, so it is joined with a blank-line
+/// separator, mirroring `with_core` exactly. Either side may be absent.
+fn with_honcho(framed: Option<String>, honcho: Option<&str>) -> Option<String> {
+    match (framed, honcho) {
+        (Some(framed), Some(honcho)) => Some(format!("{framed}\n\n{honcho}")),
+        (Some(framed), None) => Some(framed),
+        (None, Some(honcho)) => Some(honcho.to_string()),
+        (None, None) => None,
+    }
+}
+
 /// Append the `[Channel Canvas]` metadata section onto the accumulated system prompt.
 ///
 /// The canvas section already carries its `[Channel Canvas]` header (from
@@ -1485,6 +1525,63 @@ pub async fn run_prompt_task(
         }
     }
 
+    // Honcho peer-context fetch — same lifecycle and fail-open rationale as
+    // the core fetch just above (see `honcho_fetch::build_honcho_section`),
+    // cached separately in `state.honcho_sections` so a missing/unreachable
+    // Honcho backend never affects NIP-AE core injection or vice versa.
+    //
+    // Operator opt-out: `--no-honcho` / `BUZZ_ACP_NO_HONCHO` skips the fetch.
+    if ctx.honcho_enabled {
+        if let (PromptSource::Channel(cid), Some(owner_pk)) =
+            (&source, ctx.agent_owner_pubkey.as_ref())
+        {
+            let is_new_channel_session = !agent.state.sessions.contains_key(cid);
+            if is_new_channel_session && !agent.state.honcho_sections.contains_key(cid) {
+                // Bounded — we'd rather start the session with no honcho hint
+                // than block session creation on a stalled/unreachable Honcho API.
+                const HONCHO_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+                // Same display-name-with-npub-fallback pattern as the Honcho
+                // MCP server's `X-Honcho-User-Name` env var in `build_mcp_servers`.
+                let user_name = std::env::var("BUZZ_ACP_DISPLAY_NAME")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| ctx.agent_keys.public_key().to_bech32().ok())
+                    .unwrap_or_default();
+                let workspace_id = owner_pk.to_hex();
+                let peer_id = ctx.agent_keys.public_key().to_hex();
+                let fetch = crate::honcho_fetch::build_honcho_section(
+                    &ctx.honcho_http,
+                    &ctx.honcho_api_url,
+                    &ctx.honcho_auth_token,
+                    &workspace_id,
+                    &peer_id,
+                    &user_name,
+                );
+                let section = match tokio::time::timeout(HONCHO_FETCH_TIMEOUT, fetch).await {
+                    Ok(s) => s,
+                    Err(_) => {
+                        tracing::warn!(
+                            target: "honcho::context",
+                            channel = %cid,
+                            timeout_ms = HONCHO_FETCH_TIMEOUT.as_millis() as u64,
+                            "honcho context fetch timed out — emitting no section"
+                        );
+                        None
+                    }
+                };
+                if let Some(rendered) = section {
+                    tracing::info!(
+                        target: "honcho::context",
+                        channel = %cid,
+                        section_len = rendered.len(),
+                        "injected Honcho peer-context section into system prompt"
+                    );
+                    agent.state.honcho_sections.insert(*cid, rendered);
+                }
+            }
+        }
+    }
+
     // Canvas metadata fetch — same lifecycle as core: once per new channel session,
     // never for heartbeats, cached until session invalidation.
     //
@@ -1526,6 +1623,12 @@ pub async fn run_prompt_task(
         PromptSource::Heartbeat => None,
     };
 
+    // The Honcho peer-context section — same channel-scoping as core, above.
+    let agent_honcho: Option<String> = match &source {
+        PromptSource::Channel(cid) => agent.state.honcho_sections.get(cid).cloned(),
+        PromptSource::Heartbeat => None,
+    };
+
     // The canvas metadata section — channel-scoped, absent for heartbeats/DMs.
     // Prefer the committed cache; fall back to pending (for new sessions being created now).
     let agent_canvas: Option<String> = match &source {
@@ -1551,6 +1654,7 @@ pub async fn run_prompt_task(
                     &mut agent,
                     &ctx,
                     agent_core.as_deref(),
+                    agent_honcho.as_deref(),
                     agent_canvas.as_deref(),
                     title_channel.as_deref(),
                 )
@@ -1600,7 +1704,8 @@ pub async fn run_prompt_task(
             if let Some(sid) = &agent.state.heartbeat_session {
                 (sid.clone(), false)
             } else {
-                match create_session_and_apply_model(&mut agent, &ctx, None, None, None).await {
+                match create_session_and_apply_model(&mut agent, &ctx, None, None, None, None).await
+                {
                     Ok(sid) => {
                         tracing::info!(
                             target: "pool::session",
@@ -1849,6 +1954,7 @@ pub async fn run_prompt_task(
             b,
             &crate::queue::FormatPromptArgs {
                 agent_core: agent_core.as_deref(),
+                agent_honcho: agent_honcho.as_deref(),
                 channel_info: channel_info.as_ref(),
                 conversation_context: conversation_context.as_ref(),
                 profile_lookup: profile_lookup.as_ref(),
@@ -5386,6 +5492,10 @@ mod tests {
             agent_keys: agent_keys.clone(),
             agent_owner_pubkey: owner_pubkey,
             memory_enabled: false,
+            honcho_enabled: false,
+            honcho_api_url: "http://127.0.0.1:0".to_string(),
+            honcho_auth_token: String::new(),
+            honcho_http: reqwest::Client::new(),
             harness_name: "goose".to_string(),
             relay_url: "ws://127.0.0.1:3000".to_string(),
         }

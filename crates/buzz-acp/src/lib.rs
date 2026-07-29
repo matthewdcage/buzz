@@ -4,6 +4,7 @@ mod acp;
 mod config;
 mod engram_fetch;
 mod filter;
+mod honcho_fetch;
 mod observer;
 mod pool;
 mod pool_lifecycle;
@@ -1557,6 +1558,10 @@ async fn tokio_main() -> Result<()> {
             .as_deref()
             .and_then(|hex| nostr::PublicKey::from_hex(hex).ok()),
         memory_enabled: config.memory_enabled,
+        honcho_enabled: config.honcho_enabled,
+        honcho_api_url: config.honcho_api_url.clone(),
+        honcho_auth_token: config.honcho_auth_token.clone(),
+        honcho_http: reqwest::Client::new(),
         harness_name: crate::config::normalize_agent_command_identity(&config.agent_command),
         relay_url: config.relay_url.clone(),
     });
@@ -1565,6 +1570,13 @@ async fn tokio_main() -> Result<()> {
         tracing::info!(
             target: "engram::core",
             "NIP-AE core memory injection disabled (re-enable by removing --no-memory / BUZZ_ACP_NO_MEMORY)"
+        );
+    }
+
+    if !config.honcho_enabled {
+        tracing::info!(
+            target: "honcho::context",
+            "Honcho memory integration disabled (re-enable by removing --no-honcho / BUZZ_ACP_NO_HONCHO)"
         );
     }
 
@@ -4161,60 +4173,121 @@ async fn run_models(args: ModelsArgs) -> Result<()> {
 }
 
 fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
-    if config.mcp_command.is_empty() {
-        return vec![];
+    let mut servers = Vec::with_capacity(2);
+
+    if !config.mcp_command.is_empty() {
+        servers.push(McpServer {
+            name: std::path::Path::new(&config.mcp_command)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("mcp")
+                .to_string(),
+            command: config.mcp_command.clone(),
+            args: vec![],
+            env: {
+                let mut env = vec![
+                    EnvVar {
+                        name: "BUZZ_RELAY_URL".into(),
+                        value: config.relay_url.clone(),
+                    },
+                    EnvVar {
+                        name: "BUZZ_PRIVATE_KEY".into(),
+                        // bech32 encoding of a valid secret key is infallible.
+                        // Panic here is correct: injecting a bogus secret would cause
+                        // delayed, hard-to-diagnose agent failures downstream.
+                        value: config
+                            .keys
+                            .secret_key()
+                            .to_bech32()
+                            .expect("secret key bech32 encoding should never fail"),
+                    },
+                ];
+                // Forward BUZZ_AUTH_TAG (NIP-OA owner attestation credential)
+                // so the MCP server can attach it to every signed event.
+                if let Ok(auth_tag) = std::env::var("BUZZ_AUTH_TAG") {
+                    if !auth_tag.is_empty() {
+                        env.push(EnvVar {
+                            name: "BUZZ_AUTH_TAG".into(),
+                            value: auth_tag,
+                        });
+                    }
+                }
+                // Forward the agent's display name so dev-mcp can use it as the git
+                // author name instead of the raw npub. Read from the process env
+                // rather than Config: this is a pass-through of a contract owned
+                // upstream, and absent simply means dev-mcp falls back to the npub.
+                if let Ok(display_name) = std::env::var("BUZZ_ACP_DISPLAY_NAME") {
+                    if !display_name.is_empty() {
+                        env.push(EnvVar {
+                            name: "BUZZ_ACP_DISPLAY_NAME".into(),
+                            value: display_name,
+                        });
+                    }
+                }
+                env
+            },
+        });
     }
-    vec![McpServer {
-        name: std::path::Path::new(&config.mcp_command)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("mcp")
-            .to_string(),
-        command: config.mcp_command.clone(),
-        args: vec![],
-        env: {
-            let mut env = vec![
-                EnvVar {
-                    name: "BUZZ_RELAY_URL".into(),
-                    value: config.relay_url.clone(),
-                },
-                EnvVar {
-                    name: "BUZZ_PRIVATE_KEY".into(),
-                    // bech32 encoding of a valid secret key is infallible.
-                    // Panic here is correct: injecting a bogus secret would cause
-                    // delayed, hard-to-diagnose agent failures downstream.
-                    value: config
-                        .keys
-                        .secret_key()
-                        .to_bech32()
-                        .expect("secret key bech32 encoding should never fail"),
-                },
-            ];
-            // Forward BUZZ_AUTH_TAG (NIP-OA owner attestation credential)
-            // so the MCP server can attach it to every signed event.
-            if let Ok(auth_tag) = std::env::var("BUZZ_AUTH_TAG") {
-                if !auth_tag.is_empty() {
-                    env.push(EnvVar {
-                        name: "BUZZ_AUTH_TAG".into(),
-                        value: auth_tag,
-                    });
-                }
-            }
-            // Forward the agent's display name so dev-mcp can use it as the git
-            // author name instead of the raw npub. Read from the process env
-            // rather than Config: this is a pass-through of a contract owned
-            // upstream, and absent simply means dev-mcp falls back to the npub.
-            if let Ok(display_name) = std::env::var("BUZZ_ACP_DISPLAY_NAME") {
-                if !display_name.is_empty() {
-                    env.push(EnvVar {
-                        name: "BUZZ_ACP_DISPLAY_NAME".into(),
-                        value: display_name,
-                    });
-                }
-            }
-            env
-        },
-    }]
+
+    // Honcho: a second, parallel always-on MCP server entry, independent of
+    // the built-in buzz-mcp server above. On by default; opt out with
+    // `--no-honcho` / `BUZZ_ACP_NO_HONCHO`.
+    if config.honcho_enabled {
+        servers.push(build_honcho_mcp_server(config));
+    }
+
+    servers
+}
+
+/// Build the always-on Honcho MCP server entry.
+///
+/// Honcho is a self-hosted, persistent cross-session memory service running
+/// alongside Buzz: an MCP proxy (`config.honcho_url`, default
+/// `http://127.0.0.1:8787`) plus a REST API used separately by
+/// `honcho_fetch` for the session-start context section. The proxy speaks
+/// MCP over HTTP; ACP's `McpServer` config here is stdio-only (command +
+/// args + env, no URL variant — see `crate::acp::McpServer`), so we spawn
+/// `mcp-remote` (the standard stdio↔HTTP MCP bridge) pointed at the proxy
+/// URL, the same shape as any other stdio MCP server entry in this file.
+///
+/// TODO(honcho): the exact `mcp-remote` invocation (header flag syntax,
+/// env-var interpolation in header values) is modeled defensively and has
+/// not been exercised against a live Honcho MCP proxy in this sandbox
+/// (only reachable unauthenticated, returning 401). Confirm the header
+/// wiring once the proxy is reachable with real credentials.
+fn build_honcho_mcp_server(config: &Config) -> McpServer {
+    // Same pass-through pattern as `BUZZ_ACP_DISPLAY_NAME` above: prefer the
+    // externally-supplied display name; fall back to the agent's own npub
+    // when absent so Honcho always gets a stable per-agent identity.
+    let user_name = std::env::var("BUZZ_ACP_DISPLAY_NAME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| config.keys.public_key().to_bech32().ok())
+        .unwrap_or_default();
+
+    McpServer {
+        name: "honcho".into(),
+        command: "npx".into(),
+        args: vec![
+            "-y".into(),
+            "mcp-remote".into(),
+            config.honcho_url.clone(),
+            "--header".into(),
+            "Authorization:Bearer ${BUZZ_ACP_HONCHO_AUTH_TOKEN}".into(),
+            "--header".into(),
+            "X-Honcho-User-Name:${BUZZ_ACP_HONCHO_USER_NAME}".into(),
+        ],
+        env: vec![
+            EnvVar {
+                name: "BUZZ_ACP_HONCHO_AUTH_TOKEN".into(),
+                value: config.honcho_auth_token.clone(),
+            },
+            EnvVar {
+                name: "BUZZ_ACP_HONCHO_USER_NAME".into(),
+                value: user_name,
+            },
+        ],
+    }
 }
 
 #[cfg(test)]
@@ -5006,6 +5079,10 @@ mod build_mcp_servers_tests {
             presence_enabled: true,
             typing_enabled: true,
             memory_enabled: false,
+            honcho_enabled: false,
+            honcho_url: "http://127.0.0.1:8787".into(),
+            honcho_api_url: "http://localhost:8000".into(),
+            honcho_auth_token: String::new(),
             model: None,
             session_title: None,
             permission_mode: config::PermissionMode::BypassPermissions,
@@ -5168,6 +5245,87 @@ mod build_mcp_servers_tests {
             "Path::new(\".\").file_stem() is None — should fall back to \"mcp\""
         );
     }
+
+    #[test]
+    fn honcho_disabled_by_default_adds_no_server() {
+        let config = test_config();
+        assert!(
+            !config.honcho_enabled,
+            "test_config should default honcho off"
+        );
+        let servers = build_mcp_servers(&config);
+        assert!(
+            !servers.iter().any(|s| s.name == "honcho"),
+            "honcho server should be absent when honcho_enabled is false"
+        );
+    }
+
+    #[test]
+    fn honcho_enabled_adds_a_second_server_alongside_the_built_in_one() {
+        let mut config = test_config();
+        config.honcho_enabled = true;
+        let servers = build_mcp_servers(&config);
+        assert_eq!(
+            servers.len(),
+            2,
+            "expected both the built-in and honcho servers, got: {servers:?}",
+        );
+        assert!(servers.iter().any(|s| s.name == "test-mcp-server"));
+        let honcho = servers
+            .iter()
+            .find(|s| s.name == "honcho")
+            .expect("honcho server missing");
+        assert!(honcho.args.iter().any(|a| a == &config.honcho_url));
+        let env_names: Vec<&str> = honcho.env.iter().map(|e| e.name.as_str()).collect();
+        assert!(env_names.contains(&"BUZZ_ACP_HONCHO_AUTH_TOKEN"));
+        assert!(env_names.contains(&"BUZZ_ACP_HONCHO_USER_NAME"));
+    }
+
+    #[test]
+    fn honcho_server_injected_even_when_built_in_mcp_command_is_empty() {
+        let mut config = test_config();
+        config.mcp_command = "".into();
+        config.honcho_enabled = true;
+        let servers = build_mcp_servers(&config);
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "honcho");
+    }
+
+    #[test]
+    fn honcho_user_name_falls_back_to_npub_when_display_name_unset() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("BUZZ_ACP_DISPLAY_NAME");
+        let mut config = test_config();
+        config.honcho_enabled = true;
+        let servers = build_mcp_servers(&config);
+        let honcho = servers.iter().find(|s| s.name == "honcho").unwrap();
+        let user_name = honcho
+            .env
+            .iter()
+            .find(|e| e.name == "BUZZ_ACP_HONCHO_USER_NAME")
+            .map(|e| e.value.as_str())
+            .unwrap_or_default();
+        let expected_npub = config.keys.public_key().to_bech32().unwrap();
+        assert_eq!(user_name, expected_npub);
+    }
+
+    #[test]
+    fn honcho_user_name_prefers_display_name_when_set() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("BUZZ_ACP_DISPLAY_NAME", "Duncan");
+        let mut config = test_config();
+        config.honcho_enabled = true;
+        let servers = build_mcp_servers(&config);
+        std::env::remove_var("BUZZ_ACP_DISPLAY_NAME");
+        let honcho = servers.iter().find(|s| s.name == "honcho").unwrap();
+        let user_name = honcho
+            .env
+            .iter()
+            .find(|e| e.name == "BUZZ_ACP_HONCHO_USER_NAME")
+            .map(|e| e.value.as_str())
+            .unwrap_or_default();
+        assert_eq!(user_name, "Duncan");
+    }
 }
 
 #[cfg(test)]
@@ -5227,6 +5385,10 @@ mod error_outcome_emission_tests {
             presence_enabled: true,
             typing_enabled: true,
             memory_enabled: false,
+            honcho_enabled: false,
+            honcho_url: "http://127.0.0.1:8787".into(),
+            honcho_api_url: "http://localhost:8000".into(),
+            honcho_auth_token: String::new(),
             model: None,
             session_title: None,
             permission_mode: config::PermissionMode::BypassPermissions,

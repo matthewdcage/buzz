@@ -404,6 +404,45 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_NO_MEMORY", conflicts_with = "memory")]
     pub no_memory: bool,
 
+    /// Disable native Honcho memory integration.
+    ///
+    /// Honcho is a self-hosted, persistent cross-session memory service run
+    /// alongside Buzz (MCP server + REST API), independent of and parallel
+    /// to NIP-AE core memory (`--no-memory`). Injection is on by default:
+    /// the harness (1) always injects a Honcho MCP server into every agent
+    /// session, and (2) fetches the agent's Honcho peer context once per new
+    /// session and renders it as an `[Agent Memory — honcho]` prompt section.
+    /// Pass `--no-honcho` / `BUZZ_ACP_NO_HONCHO=true` to disable both.
+    #[arg(long, env = "BUZZ_ACP_NO_HONCHO")]
+    pub no_honcho: bool,
+
+    /// Base URL of the Honcho MCP proxy injected into every agent session.
+    /// Defaults to the local Honcho MCP proxy.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_HONCHO_URL",
+        default_value = "http://127.0.0.1:8787"
+    )]
+    pub honcho_url: String,
+
+    /// Base URL of the Honcho REST API used for the session-start
+    /// `[Agent Memory — honcho]` context fetch. Distinct from
+    /// `--honcho-url` (the MCP proxy) — Honcho runs the two on separate
+    /// ports. Defaults to the local Honcho REST API.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_HONCHO_API_URL",
+        default_value = "http://localhost:8000"
+    )]
+    pub honcho_api_url: String,
+
+    /// Bearer token forwarded to Honcho as `Authorization: Bearer <token>`,
+    /// both to the injected MCP server (as an env var) and on the
+    /// session-start REST context fetch. Empty by default (no auth
+    /// configured); set once Honcho auth is enabled.
+    #[arg(long, env = "BUZZ_ACP_HONCHO_AUTH_TOKEN", default_value = "")]
+    pub honcho_auth_token: String,
+
     /// Disable the [Base] platform-context section prepended to every prompt.
     /// When set, agents receive only the persona [System] prompt with no Buzz orientation.
     #[arg(long, env = "BUZZ_ACP_NO_BASE_PROMPT")]
@@ -526,6 +565,17 @@ pub struct Config {
     /// `[Agent Memory — core]` section. On by default; disabled via the
     /// `--no-memory` / `BUZZ_ACP_NO_MEMORY` opt-out.
     pub memory_enabled: bool,
+    /// Whether native Honcho memory integration is enabled — both the
+    /// injected MCP server and the per-session `[Agent Memory — honcho]`
+    /// context fetch. On by default; disabled via `--no-honcho` /
+    /// `BUZZ_ACP_NO_HONCHO`.
+    pub honcho_enabled: bool,
+    /// Base URL of the Honcho MCP proxy injected into every agent session.
+    pub honcho_url: String,
+    /// Base URL of the Honcho REST API used for the session-start context fetch.
+    pub honcho_api_url: String,
+    /// Bearer token forwarded to Honcho (MCP server env + REST context fetch).
+    pub honcho_auth_token: String,
     /// Desired LLM model ID. Applied after every `session_new_full()`.
     pub model: Option<String>,
     /// Sanitized session title, sent as `_meta.sessionTitle` on `session/new`.
@@ -1086,6 +1136,10 @@ impl Config {
             presence_enabled: !args.no_presence,
             typing_enabled: !args.no_typing,
             memory_enabled: args.memory && !args.no_memory,
+            honcho_enabled: !args.no_honcho,
+            honcho_url: args.honcho_url,
+            honcho_api_url: args.honcho_api_url,
+            honcho_auth_token: args.honcho_auth_token,
             model,
             session_title: args
                 .session_title
@@ -1123,7 +1177,7 @@ impl Config {
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} honcho={} model={} permission_mode={} {}{}",
             self.relay_url,
             self.keys.public_key().to_hex(),
             self.agent_command,
@@ -1142,6 +1196,7 @@ impl Config {
             self.presence_enabled,
             self.typing_enabled,
             self.memory_enabled,
+            self.honcho_enabled,
             self.model.as_deref().unwrap_or("(agent default)"),
             self.permission_mode,
             respond_to_detail,
@@ -1459,6 +1514,10 @@ mod tests {
             presence_enabled: true,
             typing_enabled: true,
             memory_enabled: true,
+            honcho_enabled: true,
+            honcho_url: "http://127.0.0.1:8787".into(),
+            honcho_api_url: "http://localhost:8000".into(),
+            honcho_auth_token: String::new(),
             model: None,
             session_title: None,
             permission_mode: PermissionMode::BypassPermissions,
@@ -2239,6 +2298,43 @@ channels = "ALL"
             s.contains("memory=true"),
             "summary should include memory=true when enabled, got: {s}"
         );
+    }
+
+    #[test]
+    fn test_honcho_enabled_default_true() {
+        let config = test_config(SubscribeMode::Mentions);
+        assert!(
+            config.honcho_enabled,
+            "honcho_enabled should default to true"
+        );
+    }
+
+    #[test]
+    fn test_summary_includes_honcho_enabled() {
+        let config = test_config(SubscribeMode::Mentions);
+        let s = config.summary();
+        assert!(
+            s.contains("honcho=true"),
+            "summary should include honcho=true by default, got: {s}"
+        );
+    }
+
+    #[test]
+    fn test_no_honcho_cli_flag_disables_honcho() {
+        let key = "0".repeat(64);
+        let args = CliArgs::parse_from(["buzz-acp", "--private-key", &key, "--no-honcho"]);
+        assert!(args.no_honcho);
+        let default_args = CliArgs::parse_from(["buzz-acp", "--private-key", &key]);
+        assert!(!default_args.no_honcho, "no_honcho should default to false");
+    }
+
+    #[test]
+    fn test_honcho_url_defaults_to_local_mcp_proxy() {
+        let key = "0".repeat(64);
+        let args = CliArgs::parse_from(["buzz-acp", "--private-key", &key]);
+        assert_eq!(args.honcho_url, "http://127.0.0.1:8787");
+        assert_eq!(args.honcho_api_url, "http://localhost:8000");
+        assert_eq!(args.honcho_auth_token, "");
     }
 
     #[test]
