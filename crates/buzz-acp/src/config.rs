@@ -428,11 +428,15 @@ pub struct CliArgs {
     /// Base URL of the Honcho REST API used for the session-start
     /// `[Agent Memory — honcho]` context fetch. Distinct from
     /// `--honcho-url` (the MCP proxy) — Honcho runs the two on separate
-    /// ports. Defaults to the local Honcho REST API.
+    /// ports. Defaults to the local Honcho REST API's host-mapped port
+    /// (verified live: the `honcho-api` container's internal `:8000` is
+    /// published to host `:8100` in the local Docker Compose stack at
+    /// `/home/matthew/Agents/memory-honcho` — `:8000` on the host is a
+    /// different, unrelated process).
     #[arg(
         long,
         env = "BUZZ_ACP_HONCHO_API_URL",
-        default_value = "http://localhost:8000"
+        default_value = "http://localhost:8100"
     )]
     pub honcho_api_url: String,
 
@@ -2333,7 +2337,7 @@ channels = "ALL"
         let key = "0".repeat(64);
         let args = CliArgs::parse_from(["buzz-acp", "--private-key", &key]);
         assert_eq!(args.honcho_url, "http://127.0.0.1:8787");
-        assert_eq!(args.honcho_api_url, "http://localhost:8000");
+        assert_eq!(args.honcho_api_url, "http://localhost:8100");
         assert_eq!(args.honcho_auth_token, "");
     }
 

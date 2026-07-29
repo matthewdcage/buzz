@@ -4250,11 +4250,13 @@ fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
 /// `mcp-remote` (the standard stdio↔HTTP MCP bridge) pointed at the proxy
 /// URL, the same shape as any other stdio MCP server entry in this file.
 ///
-/// TODO(honcho): the exact `mcp-remote` invocation (header flag syntax,
-/// env-var interpolation in header values) is modeled defensively and has
-/// not been exercised against a live Honcho MCP proxy in this sandbox
-/// (only reachable unauthenticated, returning 401). Confirm the header
-/// wiring once the proxy is reachable with real credentials.
+/// Verified live: spawning `npx -y mcp-remote <url> --header
+/// "Authorization:Bearer ${BUZZ_ACP_HONCHO_AUTH_TOKEN}" --header
+/// "X-Honcho-User-Name:${BUZZ_ACP_HONCHO_USER_NAME}"` with those two vars
+/// set in the child's environment produces mcp-remote's own log lines
+/// `Replacing ${VAR} with environment value in header '...'` followed by
+/// `Connected to remote server using StreamableHTTPClientTransport` /
+/// `Proxy established successfully` against the local Honcho MCP proxy.
 fn build_honcho_mcp_server(config: &Config) -> McpServer {
     // Same pass-through pattern as `BUZZ_ACP_DISPLAY_NAME` above: prefer the
     // externally-supplied display name; fall back to the agent's own npub
