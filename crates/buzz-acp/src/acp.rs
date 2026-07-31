@@ -215,6 +215,9 @@ pub struct AcpClient {
     /// deltas. Both goose and buzz-agent emit this notification; goose gates
     /// on client capability advertisement, buzz-agent emits unconditionally.
     goose_usage: UsageTracker,
+    /// Accumulated `agent_message_chunk` text for the current turn.
+    /// Cleared at prompt start; consumed by Honcho Phase 2 write hook.
+    turn_agent_text: String,
 }
 
 /// Recursively merge `overlay` into `base`, with `overlay` winning on scalar/shape
@@ -564,6 +567,7 @@ impl AcpClient {
             steering_supported: false,
             steer_rx: None,
             goose_usage: UsageTracker::default(),
+            turn_agent_text: String::new(),
         })
     }
 
@@ -773,6 +777,7 @@ impl AcpClient {
         // prompt so that any setup notifications recorded earlier are not
         // misattributed to this turn.
         self.goose_usage.begin_turn(session_id);
+        self.turn_agent_text.clear();
 
         self.last_prompt_id = Some(self.next_id);
         let id = self.next_id;
@@ -876,6 +881,11 @@ impl AcpClient {
     /// publish a kind 44200 NIP-AM event.
     pub fn take_turn_usage(&mut self) -> Option<TurnUsage> {
         self.goose_usage.take()
+    }
+
+    /// Take accumulated agent response text for the completed turn.
+    pub fn take_turn_agent_text(&mut self) -> String {
+        std::mem::take(&mut self.turn_agent_text)
     }
 
     /// Install a per-turn steer request channel for goose-native
@@ -1728,6 +1738,7 @@ impl AcpClient {
         match update_type {
             "agent_message_chunk" => {
                 if let Some(text) = update["content"]["text"].as_str() {
+                    self.turn_agent_text.push_str(text);
                     tracing::info!(target: "acp::stream", "{text}");
                 }
                 false
