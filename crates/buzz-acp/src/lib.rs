@@ -5,6 +5,7 @@ mod config;
 mod engram_fetch;
 mod filter;
 mod honcho_fetch;
+mod honcho_write;
 mod observer;
 mod pool;
 mod pool_lifecycle;
@@ -1562,6 +1563,8 @@ async fn tokio_main() -> Result<()> {
         honcho_api_url: config.honcho_api_url.clone(),
         honcho_auth_token: config.honcho_auth_token.clone(),
         honcho_http: reqwest::Client::new(),
+        honcho_write_enabled: config.honcho_write_enabled,
+        honcho_write_channels: config.honcho_write_channels.clone(),
         harness_name: crate::config::normalize_agent_command_identity(&config.agent_command),
         relay_url: config.relay_url.clone(),
     });
@@ -5085,6 +5088,8 @@ mod build_mcp_servers_tests {
             honcho_url: "http://127.0.0.1:8787".into(),
             honcho_api_url: "http://localhost:8000".into(),
             honcho_auth_token: String::new(),
+            honcho_write_enabled: false,
+            honcho_write_channels: vec![],
             model: None,
             session_title: None,
             permission_mode: config::PermissionMode::BypassPermissions,
@@ -5391,6 +5396,8 @@ mod error_outcome_emission_tests {
             honcho_url: "http://127.0.0.1:8787".into(),
             honcho_api_url: "http://localhost:8000".into(),
             honcho_auth_token: String::new(),
+            honcho_write_enabled: false,
+            honcho_write_channels: vec![],
             model: None,
             session_title: None,
             permission_mode: config::PermissionMode::BypassPermissions,

@@ -564,6 +564,10 @@ pub struct PromptContext {
     /// HTTP client used for the Honcho context fetch. Cheap to clone (wraps
     /// an internal connection-pool `Arc`, like `RestClient::http`).
     pub honcho_http: reqwest::Client,
+    /// Push completed channel turns into Honcho (Phase 2 write path).
+    pub honcho_write_enabled: bool,
+    /// When non-empty, restrict Honcho turn writes to these channel UUIDs.
+    pub honcho_write_channels: Vec<Uuid>,
     /// Harness identity string for NIP-AM `harness` field. Derived from the
     /// configured `agent_command` at startup (e.g. `"goose"`, `"buzz-agent"`).
     pub harness_name: String,
@@ -1314,6 +1318,66 @@ fn with_honcho(framed: Option<String>, honcho: Option<&str>) -> Option<String> {
         (None, Some(honcho)) => Some(honcho.to_string()),
         (None, None) => None,
     }
+}
+
+/// Fire-and-forget push of a completed channel turn into Honcho (Phase 2).
+fn spawn_honcho_turn_write(
+    ctx: std::sync::Arc<PromptContext>,
+    channel_id: Uuid,
+    batch: Option<crate::queue::FlushBatch>,
+    agent_text: String,
+) {
+    if !ctx.honcho_write_enabled {
+        return;
+    }
+    if !ctx.honcho_write_channels.is_empty()
+        && !ctx.honcho_write_channels.contains(&channel_id)
+    {
+        return;
+    }
+    let Some(owner_pk) = ctx.agent_owner_pubkey.as_ref() else {
+        return;
+    };
+    let Some(batch) = batch else {
+        return;
+    };
+    let agent_peer = ctx.agent_keys.public_key().to_hex();
+    let Some((user_peer, user_content)) =
+        crate::honcho_write::extract_user_turn(&batch, &agent_peer)
+    else {
+        return;
+    };
+    let thread_root = crate::honcho_write::thread_root_from_batch(&batch);
+    let session_id =
+        crate::honcho_write::honcho_session_id(channel_id, thread_root.as_deref());
+    let agent_content = {
+        let t = agent_text.trim();
+        if t.is_empty() {
+            None
+        } else {
+            Some(t.to_string())
+        }
+    };
+    let metadata = serde_json::json!({
+        "source": "buzz-acp",
+        "channel_id": channel_id.to_string(),
+        "thread_root": thread_root,
+    });
+    let turn = crate::honcho_write::HonchoTurnWrite {
+        workspace_id: owner_pk.to_hex(),
+        session_id,
+        agent_peer_id: agent_peer,
+        user_peer_id: user_peer,
+        user_content,
+        agent_content,
+        metadata,
+    };
+    let client = ctx.honcho_http.clone();
+    let api_url = ctx.honcho_api_url.clone();
+    let token = ctx.honcho_auth_token.clone();
+    tokio::spawn(async move {
+        crate::honcho_write::push_turn(&client, &api_url, &token, turn).await;
+    });
 }
 
 /// Append the `[Channel Canvas]` metadata section onto the accumulated system prompt.
@@ -2155,6 +2219,14 @@ pub async fn run_prompt_task(
                             Some(buzz_core::agent_turn_metric::StopReason::EndTurn),
                         )
                         .await;
+                        if let PromptSource::Channel(cid) = &source {
+                            spawn_honcho_turn_write(
+                                ctx.clone(),
+                                *cid,
+                                batch.clone(),
+                                agent.acp.take_turn_agent_text(),
+                            );
+                        }
                         send_prompt_result(
                             &result_tx,
                             &turn_id,
@@ -2217,6 +2289,15 @@ pub async fn run_prompt_task(
                 Some(core_stop),
             )
             .await;
+
+            if let PromptSource::Channel(cid) = &source {
+                spawn_honcho_turn_write(
+                    ctx.clone(),
+                    *cid,
+                    batch.clone(),
+                    agent.acp.take_turn_agent_text(),
+                );
+            }
 
             send_prompt_result(
                 &result_tx,
@@ -5496,6 +5577,8 @@ mod tests {
             honcho_api_url: "http://127.0.0.1:0".to_string(),
             honcho_auth_token: String::new(),
             honcho_http: reqwest::Client::new(),
+            honcho_write_enabled: false,
+            honcho_write_channels: vec![],
             harness_name: "goose".to_string(),
             relay_url: "ws://127.0.0.1:3000".to_string(),
         }

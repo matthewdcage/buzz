@@ -447,6 +447,17 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_HONCHO_AUTH_TOKEN", default_value = "")]
     pub honcho_auth_token: String,
 
+    /// Disable pushing completed Buzz turns into Honcho (Phase 2 write path).
+    /// Honcho MCP injection and session-start context fetch remain enabled unless
+    /// `--no-honcho` is also set.
+    #[arg(long, env = "BUZZ_ACP_NO_HONCHO_WRITE")]
+    pub no_honcho_write: bool,
+
+    /// Limit Honcho turn writes to these channel UUIDs (comma-separated).
+    /// Empty = all channels when Honcho write is enabled.
+    #[arg(long, env = "BUZZ_ACP_HONCHO_WRITE_CHANNELS", value_delimiter = ',')]
+    pub honcho_write_channels: Vec<uuid::Uuid>,
+
     /// Disable the [Base] platform-context section prepended to every prompt.
     /// When set, agents receive only the persona [System] prompt with no Buzz orientation.
     #[arg(long, env = "BUZZ_ACP_NO_BASE_PROMPT")]
@@ -580,6 +591,10 @@ pub struct Config {
     pub honcho_api_url: String,
     /// Bearer token forwarded to Honcho (MCP server env + REST context fetch).
     pub honcho_auth_token: String,
+    /// Push completed channel turns into Honcho via REST (Phase 2).
+    pub honcho_write_enabled: bool,
+    /// When non-empty, only these channels receive Honcho turn writes.
+    pub honcho_write_channels: Vec<uuid::Uuid>,
     /// Desired LLM model ID. Applied after every `session_new_full()`.
     pub model: Option<String>,
     /// Sanitized session title, sent as `_meta.sessionTitle` on `session/new`.
@@ -1144,6 +1159,8 @@ impl Config {
             honcho_url: args.honcho_url,
             honcho_api_url: args.honcho_api_url,
             honcho_auth_token: args.honcho_auth_token,
+            honcho_write_enabled: !args.no_honcho && !args.no_honcho_write,
+            honcho_write_channels: args.honcho_write_channels,
             model,
             session_title: args
                 .session_title
@@ -1522,6 +1539,8 @@ mod tests {
             honcho_url: "http://127.0.0.1:8787".into(),
             honcho_api_url: "http://localhost:8000".into(),
             honcho_auth_token: String::new(),
+            honcho_write_enabled: true,
+            honcho_write_channels: vec![],
             model: None,
             session_title: None,
             permission_mode: PermissionMode::BypassPermissions,
